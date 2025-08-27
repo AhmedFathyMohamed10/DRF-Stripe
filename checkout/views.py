@@ -1,12 +1,17 @@
 import stripe as st
+import logging
 from rest_framework import generics
 from rest_framework.response import Response
 from rest_framework import status
 from django.conf import settings
+from django.views.decorators.csrf import csrf_exempt
+from django.utils.decorators import method_decorator
 from product.models import Product
 from .models import Transaction
 
 st.api_key = settings.STRIPE_SECRET_KEY
+
+logger = logging.getLogger(__name__)
 
 
 class CreateCheckoutSessionView(generics.GenericAPIView):
@@ -90,3 +95,43 @@ class SuccessView(generics.GenericAPIView):
 class CancelView(generics.GenericAPIView):
     def get(self, request, *args, **kwargs):
         return Response({"message": "Payment was cancelled."}, status=status.HTTP_200_OK)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class StripeWebhookView(generics.GenericAPIView):
+    def post(self, request, *args, **kwargs):
+        payload = request.body
+        sig_header = request.META.get('HTTP_STRIPE_SIGNATURE')
+        endpoint_secret = settings.STRIPE_WEBHOOK_SECRET 
+
+        try:
+            event = st.Webhook.construct_event(
+                payload, sig_header, endpoint_secret
+            )
+            logger.info('Webhook received: %s', event['type'])
+        except ValueError:
+            return Response({'error': 'Invalid payload'}, status=400)
+        except st.error.SignatureVerificationError:
+            return Response({'error': 'Invalid signature'}, status=400)
+
+        if event['type'] == 'checkout.session.completed':
+            session = event['data']['object']
+
+            transaction, created = Transaction.objects.get_or_create(
+                stripe_session_id=session['id'],
+                defaults={
+                    "status": session.get("payment_status", "unpaid"),
+                    "stripe_payment_intent": session.get("payment_intent"),
+                    "amount": session.get("amount_total", 0) / 100,
+                    "currency": session.get("currency", "usd"),
+                }
+            )
+
+            if not created:
+                transaction.status = session.get("payment_status", transaction.status)
+                transaction.stripe_payment_intent = session.get("payment_intent", transaction.stripe_payment_intent)
+                transaction.save()
+
+            logger.info(f"Transaction {transaction.id} processed (created={created})")
+
+        return Response({'status': 'success'}, status=200)
